@@ -1,0 +1,15 @@
+# 忽略 Python 缓存
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 忽略打印产物（体积大，可由脚本自行生成）
+*.gcode
+*.gco
+*.g
+
+# 忽略生成的报告与导出物（仓库中仅保留样例）
+sample_report.json
+sample_layers.csv
+*.xlsx
