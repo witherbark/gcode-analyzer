@@ -81,6 +81,14 @@ RE_PRINTER = re.compile(r";\s*(?:printer_model|model)\s*=\s*(.+)$", re.I)
 RE_FILAMENT = re.compile(r";\s*filament_type\s*=\s*(.+)$", re.I)
 RE_LAYER_HEIGHT = re.compile(r";\s*layer_height\s*=\s*([\d.]+)", re.I)
 RE_NOZZLE = re.compile(r";\s*nozzle_diameter\s*=\s*([\d.]+)", re.I)
+# 切片软件在每次层变化后写出的"本层高度"标注，例如：
+#     ;LAYER_CHANGE
+#     ;:0.2
+#     ;HEIGHT:0.2
+# 这是切片软件自己认定的本层高度，比自己从 Z 坐标反推更可靠：
+# 带探测/调平的机型在层变化后还会有一段抬 Z 的走位，若取"第一条带 Z 的指令"，
+# 会把探测高度（如 0.6）误当成层高，而实际打印高度是 0.2。
+RE_HEIGHT_COMMENT = re.compile(r"^;\s*HEIGHT:\s*([\d.]+)", re.I)
 
 
 # =========================================================================
@@ -223,6 +231,11 @@ def analyze_file(path, density=1.24, filament_diameter=1.75,
                 if RE_LAYER_CHANGE.search(comment):
                     _start_new_layer(state)
 
+                # 本层层高标注（写在层变化标记之后，用于校正层高）
+                m = RE_HEIGHT_COMMENT.match(comment)
+                if m and state["current_layer"] is not None:
+                    state["current_layer"]["z_annotated"] = float(m.group(1))
+
                 # 层变化（Cura 风格 ;LAYER:3）
                 m = RE_LAYER_CURA.search(comment)
                 if m:
@@ -364,9 +377,11 @@ def _start_new_layer(state, index=None):
     state["current_layer"] = {
         "layer": state["layer_index"],
         # z：本层实际打印高度，由第一条"边挤边走"的 Z 填入
+        # z_annotated：切片软件写的 ;HEIGHT: 标注（最权威，优先使用）
         # z_fallback：本层第一条带 Z 的指令（可能是空驶抬 Z），z 取不到时用
         "z": None,
-        "z_fallback": None,
+        "z_annotated": None,
+        "z_fallback": None,  # 兜底：本层第一条带 Z 的指令（可能是探针抬 Z）
         "time_s": 0.0,
         "extrude_mm": 0.0,
     }
@@ -408,8 +423,13 @@ def _summarize(path, state, total_lines, density, filament_diameter,
     # ---------- 逐层整理 ----------
     layers = []
     for item in state["layers"]:
-        # z 取不到（该层没有"边挤边走"的 Z）时退回第一条带 Z 的指令值
-        z = item["z"] if item["z"] is not None else item["z_fallback"]
+        # 层高取值优先级：
+        # 1) 切片软件的 ;HEIGHT: 标注（最权威）
+        # 2) 本层第一条"边挤边走"指令的 Z
+        # 3) 本层第一条带 Z 的指令（兜底）
+        z = item["z_annotated"]
+        if z is None:
+            z = item["z"] if item["z"] is not None else item["z_fallback"]
         if z is None:
             z = 0.0
         layers.append({
