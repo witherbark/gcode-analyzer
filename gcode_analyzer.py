@@ -62,9 +62,19 @@ RE_TIME_SEC = re.compile(r";\s*TIME\s*:\s*(\d+)", re.I)                    # ;TI
 RE_TIME_HMS = re.compile(r"(\d+)\s*h\s*(\d+)\s*m(?:\s*(\d+)\s*s)?", re.I)   # 1h 2m 3s
 RE_TIME_MS = re.compile(r";\s*estimated printing time[^=]*=\s*(.+)$", re.I)  # ; estimated printing time = 1h 2m
 
-# 层变化标记：PrusaSlicer/OrcaSlicer 用 ;LAYER_CHANGE，Cura 用 ;LAYER:3
-RE_LAYER_CHANGE = re.compile(r";\s*LAYER_CHANGE", re.I)
+# 层变化标记：PrusaSlicer/OrcaSlicer/部分 Creality 固件用 ;LAYER_CHANGE，Cura 用 ;LAYER:3
+#
+# 注意这里必须要求标记后面不能再跟字母数字：
+# 切片文件的尾部配置区会出现 `; layer_change_gcode = ...` 这类赋值语句，
+# 如果只用 "layer_change" 做子串匹配，就会把它误当成一次层变化，凭空多出一层。
+# 实测某真实文件：真正的标记 767 个，被这条误匹配撑成 768 个。
+RE_LAYER_CHANGE = re.compile(r";\s*LAYER_CHANGE(?![A-Za-z0-9_])", re.I)
 RE_LAYER_CURA = re.compile(r";\s*LAYER\s*:\s*(\d+)", re.I)
+
+# 文件结尾收尾动作（抬 Z、回抽、擦拭）会再建出一层，但耗料极少。
+# 低于这个阈值就判定为"收尾层"，并回最后一层，不计入层数。
+# 参考：正常层挤出量通常在几十到几百毫米，收尾动作不到 1 毫米。
+TRAILING_LAYER_MIN_EXTRUDE_MM = 1.0
 
 # 机型信息
 RE_PRINTER = re.compile(r";\s*(?:printer_model|model)\s*=\s*(.+)$", re.I)
@@ -262,6 +272,12 @@ def analyze_file(path, density=1.24, filament_diameter=1.75,
                              (ny - state["y"]) ** 2 +
                              (nz - state["z"]) ** 2)
 
+            # 3.5) 记录本层的实际打印高度
+            #      层变化标记出现时，Z 还是上一层的值（第一层甚至还是文件的
+            #      初始值），真正的层高写在标记之后第一条带 Z 的指令里。
+            #      这里优先取"第一条边挤边走"的 Z（那才是真正打印的高度），
+            #      没有挤出的 Z 先存着兜底。
+
             # 4) 算这一段挤出了多少耗材
             #    绝对模式(M82)：E 是"累计挤出总量"，所以要用差值
             #    相对模式(M83)：E 就是"本段挤出量"，直接用
@@ -273,6 +289,13 @@ def analyze_file(path, density=1.24, filament_diameter=1.75,
                     state["e"] = params["E"]
             else:
                 e_delta = 0.0
+
+            if "Z" in params and state["current_layer"] is not None:
+                cl = state["current_layer"]
+                if cl["z_fallback"] is None:
+                    cl["z_fallback"] = nz
+                if e_delta > 0 and cl["z"] is None:
+                    cl["z"] = nz
 
             # 5) 累计
             state["segment_count"] += 1
@@ -307,18 +330,43 @@ def analyze_file(path, density=1.24, filament_diameter=1.75,
     return result
 
 
+def _attach_or_append_last_layer(state, layer):
+    """
+    最后一层的收尾处理。
+
+    切片文件在最后一次层变化之后还会有一段收尾动作（抬 Z、回抽、擦拭）。
+    这些动作的挤出量极少，却会被当成新的一层，使层数比切片软件自报的多 1。
+    实测某真实文件：最后一个层标记之后只有 0 mm 正挤出、耗时 0 s，却被计成
+    第 768 层。低于阈值就并回最后一层，不计入层数。
+    """
+    if state["layers"] and layer["extrude_mm"] < TRAILING_LAYER_MIN_EXTRUDE_MM:
+        last = state["layers"][-1]
+        last["time_s"] += layer["time_s"]
+        last["extrude_mm"] += layer["extrude_mm"]
+        # 收尾层没打印内容，不该改变最后一层的层高标注
+        return
+    state["layers"].append(layer)
+
+
 def _start_new_layer(state, index=None):
     """
     开始记录新的一层。
-    如果上一层的记录还开着，就先收尾（补上层号）。
+    如果上一层的记录还开着，就先收尾。
     """
     if state["current_layer"] is not None:
         state["layers"].append(state["current_layer"])
 
-    state["layer_index"] = index if index is not None else state["layer_index"] + 1
+    if index is not None:
+        state["layer_index"] = index
+    else:
+        state["layer_index"] += 1
+
     state["current_layer"] = {
         "layer": state["layer_index"],
-        "z": state["z"],
+        # z：本层实际打印高度，由第一条"边挤边走"的 Z 填入
+        # z_fallback：本层第一条带 Z 的指令（可能是空驶抬 Z），z 取不到时用
+        "z": None,
+        "z_fallback": None,
         "time_s": 0.0,
         "extrude_mm": 0.0,
     }
@@ -329,7 +377,7 @@ def _summarize(path, state, total_lines, density, filament_diameter,
     """把解析过程中的原始累计量换算成人类可读的指标，并计算成本。"""
     # 把最后一层收尾
     if state["current_layer"] is not None:
-        state["layers"].append(state["current_layer"])
+        _attach_or_append_last_layer(state, state["current_layer"])
 
     # ---------- 耗材重量 ----------
     # 挤出长度(mm) -> 体积(mm³) -> 质量(g)
@@ -360,9 +408,13 @@ def _summarize(path, state, total_lines, density, filament_diameter,
     # ---------- 逐层整理 ----------
     layers = []
     for item in state["layers"]:
+        # z 取不到（该层没有"边挤边走"的 Z）时退回第一条带 Z 的指令值
+        z = item["z"] if item["z"] is not None else item["z_fallback"]
+        if z is None:
+            z = 0.0
         layers.append({
             "layer": item["layer"],
-            "z_mm": round(item["z"], 3),
+            "z_mm": round(z, 3),
             "time_min": round(item["time_s"] / 60.0, 2),
             "extrude_mm": round(item["extrude_mm"], 1),
         })
